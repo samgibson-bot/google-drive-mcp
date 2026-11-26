@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **accounts:** with more than one account connected, a successful write reply ends with `[acting as <email> (<alias>)]`, naming the account the call was routed to. A write that resolved to the default when another account was meant otherwise reads exactly like success. The line is added once at the dispatch point, for every tool classed as a write, so no handler changes. Reads, errors and admin tools are left alone, and so is every reply when only one account is connected, including service-account and external-token modes ([#214](https://github.com/piotr-agier/google-drive-mcp/issues/214))
+- **accounts:** with more than one account connected, a successful write reply ends with a text block of its own, `[acting as <email> (<alias>)]`, naming the account the call was routed to. An account whose email could not be read yet shows `[acting as <alias>]`. Reads, errors and admin tools are left alone, and so is every reply when only one account is connected, including service-account and external-token modes ([#214](https://github.com/piotr-agier/google-drive-mcp/issues/214))
 
 ## [2.13.0](https://github.com/piotr-agier/google-drive-mcp/compare/v2.12.0...v2.13.0) (2026-10-15)
 

@@ -200,7 +200,7 @@ Every non-admin tool accepts an optional `account` parameter whose value is one 
 
 **Writes refuse ambiguity.** If two accounts both satisfy a write, the server errors out with the list of eligible aliases and a pointer at `manage_accounts set_default`. Be explicit or pick a default. Reads on an ambiguous call currently require the same explicit choice; cross-account read fanout is planned for a future release.
 
-**Writes name the account that took them.** With more than one account connected, a successful write reply ends with `[acting as <email> (<alias>)]`, so a write that landed on the default when you meant another account shows up in the reply. Reads, errors and `manage_accounts` replies are left as they are, and with a single account nothing is added.
+**Writes name the account that took them.** With more than one account connected, a successful write reply ends with one more text block, `[acting as <email> (<alias>)]`, so a write that landed on the default when you meant another account shows up in the reply. The line is a separate block, so a JSON reply still parses. An account whose email could not be read yet shows `[acting as <alias>]`. Reads, errors and `manage_accounts` replies are left as they are, and with a single account nothing is added.
 
 ### Typical flow
 

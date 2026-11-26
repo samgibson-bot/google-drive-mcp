@@ -543,21 +543,15 @@ function withAnnotations<T extends { name: string }>(def: T): T {
  * With more than one account connected, a write that landed on the default
  * instead of the intended account reads exactly like success. Ending each
  * successful write reply with the account that took it makes that visible.
- * Errors pass through unchanged, and so does every reply in single-account
- * mode, where there is nothing to tell apart.
+ * The stamp is a content block of its own, so a reply that is a single JSON
+ * block still parses. Errors pass through unchanged, and so does every reply
+ * in single-account mode, where there is nothing to tell apart.
  */
 function withActingAccount(result: ToolResult, account: AccountRecord): ToolResult {
   if (result.isError) return result;
-  const blocks = result.content;
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    const block = blocks[i];
-    if (block.type === 'text' && typeof block.text === 'string') {
-      const content = [...blocks];
-      content[i] = { ...block, text: `${block.text}\n[acting as ${account.email} (${account.alias})]` };
-      return { ...result, content };
-    }
-  }
-  return result;
+  // An account whose email lookup failed is stored with email 'unknown'.
+  const who = account.pendingIdentity ? account.alias : `${account.email} (${account.alias})`;
+  return { ...result, content: [...result.content, { type: 'text', text: `[acting as ${who}]` }] };
 }
 
 function normalizeAccountArg(raw: unknown): string | undefined {
