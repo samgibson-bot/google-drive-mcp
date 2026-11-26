@@ -16,8 +16,8 @@ import { downloadDriveFile, GOOGLE_WORKSPACE_EXPORT_FORMATS } from '../download-
 import { getSecureTokenPath } from '../auth/utils.js';
 import { SCOPE_ALIASES, SCOPE_PRESETS, resolveOAuthScopes, splitScopes } from '../auth/scopes.js';
 import { getActiveAuthMode, describeBypassedTokens, allAuthModeOverrideEnvVars, type ActiveAuthMode } from '../auth/externalAuth.js';
-import { getEffectiveIdentity } from '../auth/identity.js';
-import { runApiProbe, type ApiProbeResult } from './apiProbe.js';
+import { getEffectiveIdentity, type EffectiveIdentity } from '../auth/identity.js';
+import { requestsProbeScope, runApiProbe, type ApiProbeResult } from './apiProbe.js';
 import { withRetry, UPLOAD_TIMEOUT_MS } from '../utils/retry.js';
 
 // ---------------------------------------------------------------------------
@@ -377,25 +377,51 @@ const API_PROBE_LABELS: Record<ProbedApi, string> = {
 const API_PROBE_ID = 'mcp-api-probe-nonexistent';
 
 /**
- * authGetStatus' `checkApis`: one read-only request per API, in parallel. A
- * client that cannot be built is reported as unknown rather than failing the
- * whole status call.
+ * authGetStatus' `checkApis`, started together with the identity lookup it shares
+ * a call with. Docs, Sheets, Slides and Calendar each get one read-only request.
+ * Drive is read from the identity lookup, which is already a Drive call, and is
+ * probed on its own only when that lookup failed. An API whose scope was not
+ * requested is skipped. With no usable client nothing is sent, since the requests
+ * would reach Google with no credentials.
  */
 async function probeApis(
   ctx: ToolContext,
+  requestedScopes: string[],
   drive: drive_v3.Drive | undefined,
+  identity: Promise<EffectiveIdentity>,
 ): Promise<Record<ProbedApi, ApiProbeResult>> {
   const auth = ctx.authClient;
-  const [driveResult, docs, sheets, slides, calendar] = await Promise.all([
-    drive
+  if (!auth) {
+    const noClient = (): ApiProbeResult => ({
+      status: 'unknown',
+      message: "No authenticated client (no account, or the default account's client could not be built), so no API was probed.",
+    });
+    return { drive: noClient(), docs: noClient(), sheets: noClient(), slides: noClient(), calendar: noClient() };
+  }
+  const probe = (
+    api: 'docs' | 'sheets' | 'slides' | 'calendar',
+    request: (signal: AbortSignal) => Promise<unknown>,
+  ): Promise<ApiProbeResult> =>
+    requestsProbeScope(requestedScopes, api)
+      ? runApiProbe(request)
+      : Promise.resolve({
+          status: 'unknown',
+          message: `Not checked: no ${API_PROBE_LABELS[api].replace(/^Google /, '')} scope requested`,
+        });
+  const driveResult = identity.then((who): Promise<ApiProbeResult> | ApiProbeResult => {
+    if (!who.error) return { status: 'enabled' };
+    return drive
       ? runApiProbe((signal) => drive.about.get({ fields: 'kind' }, { signal }))
-      : Promise.resolve<ApiProbeResult>({ status: 'unknown', message: 'No authenticated Drive client' }),
-    runApiProbe((signal) => ctx.google.docs({ version: 'v1', auth }).documents.get({ documentId: API_PROBE_ID, fields: 'documentId' }, { signal })),
-    runApiProbe((signal) => ctx.google.sheets({ version: 'v4', auth }).spreadsheets.get({ spreadsheetId: API_PROBE_ID, fields: 'spreadsheetId' }, { signal })),
-    runApiProbe((signal) => ctx.google.slides({ version: 'v1', auth }).presentations.get({ presentationId: API_PROBE_ID, fields: 'presentationId' }, { signal })),
-    runApiProbe((signal) => ctx.getCalendar().calendars.get({ calendarId: API_PROBE_ID, fields: 'id' }, { signal })),
+      : { status: 'unknown', message: 'No authenticated Drive client' };
+  });
+  const [driveStatus, docs, sheets, slides, calendar] = await Promise.all([
+    driveResult,
+    probe('docs', (signal) => ctx.google.docs({ version: 'v1', auth }).documents.get({ documentId: API_PROBE_ID, fields: 'documentId' }, { signal })),
+    probe('sheets', (signal) => ctx.google.sheets({ version: 'v4', auth }).spreadsheets.get({ spreadsheetId: API_PROBE_ID, fields: 'spreadsheetId' }, { signal })),
+    probe('slides', (signal) => ctx.google.slides({ version: 'v1', auth }).presentations.get({ presentationId: API_PROBE_ID, fields: 'presentationId' }, { signal })),
+    probe('calendar', (signal) => ctx.getCalendar().calendars.get({ calendarId: API_PROBE_ID, fields: 'id' }, { signal })),
   ]);
-  return { drive: driveResult, docs, sheets, slides, calendar };
+  return { drive: driveStatus, docs, sheets, slides, calendar };
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +766,7 @@ export const toolDefinitions: ToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        checkApis: { type: "boolean", description: "Also check whether the Drive, Docs, Sheets, Slides and Calendar APIs are enabled for the OAuth client's Google Cloud project, with one read-only request to each (five extra API calls). Each is reported as enabled, disabled (with the URL to enable it) or unknown. Default false" }
+        checkApis: { type: "boolean", description: "Also check whether the Drive, Docs, Sheets, Slides and Calendar APIs are enabled for the Google Cloud project behind the current credentials. Docs, Sheets, Slides and Calendar get one read-only request each (up to four extra API calls); Drive is read from the identity lookup. An API whose scope was not requested is skipped. Each is reported as enabled, disabled (with the URL to enable it) or unknown. Default false" }
       }
     }
   },
@@ -2422,8 +2448,9 @@ export async function handleTool(
       } catch {
         drive = undefined;
       }
-      const identity = await getEffectiveIdentity(drive);
-      const apis = checkApis ? await probeApis(ctx, drive) : undefined;
+      const identityLookup = getEffectiveIdentity(drive);
+      const apisLookup = checkApis ? probeApis(ctx, requestedScopes, drive, identityLookup) : undefined;
+      const [identity, apis] = await Promise.all([identityLookup, apisLookup]);
 
       const warnings: string[] = [];
       if (authMode !== 'oauth') {
@@ -2438,7 +2465,7 @@ export async function handleTool(
       for (const [api, result] of Object.entries(apis ?? {})) {
         if (result.status !== 'disabled') continue;
         const where = result.activationUrl ? `Enable it at ${result.activationUrl}` : `Google said: ${result.message}`;
-        warnings.push(`The ${API_PROBE_LABELS[api as ProbedApi]} API is disabled for this OAuth client's Google Cloud project. ${where}`);
+        warnings.push(`The ${API_PROBE_LABELS[api as ProbedApi]} API is disabled for the Google Cloud project behind the current credentials. ${where}`);
       }
 
       const payload = {

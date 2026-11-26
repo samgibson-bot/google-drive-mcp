@@ -8,22 +8,21 @@ import { apiErrorFixture as fixture, gaxiosErrorFor } from '../helpers/gaxios-er
 // The classifier only ever sees errors thrown by googleapis, so every case here
 // is a real gaxios error (see gaxiosErrorFor).
 //
-// Fixture sources (bodies copied verbatim from public reports):
-// - service-disabled-errorinfo.json: google-gemini/gemini-cli#5331 (comment
-//   3214363323). The current shape: SERVICE_DISABLED in a google.rpc.ErrorInfo
-//   with metadata.activationUrl, plus accessNotConfigured in errors[]. The
-//   service is not a Workspace one: no public body in this shape from a
-//   Workspace API turned up. The terminal's line wraps were rejoined and the
-//   CLI's outer array dropped.
-// - service-disabled-legacy.json: burnash/gspread#513 (comment 436316154). The
-//   older shape from the Sheets API: no reason code anywhere, only the message
-//   and a google.rpc.Help link.
-// - insufficient-permission.json: burnash/gspread#513 (the issue itself). A 403
-//   that is not a disabled API.
+// Fixtures are in test/fixtures/api-errors/, with project ids and numbers replaced by
+// placeholders:
+// - service-disabled-errorinfo.json: the current disabled-API shape. SERVICE_DISABLED
+//   in a google.rpc.ErrorInfo with metadata.activationUrl, plus accessNotConfigured in
+//   errors[]. The body is from a Google API that is not a Workspace one (Gemini for
+//   Google Cloud), copied from a public report. No body in this shape from a Workspace
+//   API has been captured yet.
+// - service-disabled-legacy.json: Sheets API, the older shape. No reason code anywhere,
+//   only the message and a google.rpc.Help link. Copied from a public report.
+// - insufficient-permission.json: a 403 for a missing scope, which is not a disabled
+//   API. Copied from a public report.
 // - not-found.json: Docs documents.get on a nonexistent id, captured live.
 
 test('current ErrorInfo shape is disabled, with the activation URL from ErrorInfo metadata', async () => {
-  const url = 'https://console.developers.google.com/apis/api/cloudaicompanion.googleapis.com/overview?project=auto-gpt';
+  const url = 'https://console.developers.google.com/apis/api/cloudaicompanion.googleapis.com/overview?project=example-project';
   const body = fixture('service-disabled-errorinfo.json');
   const asSent = classifyApiProbeError(await gaxiosErrorFor(403, body));
   assert.equal(asSent.status, 'disabled');
@@ -47,7 +46,7 @@ test('legacy message-only shape is disabled, with the activation URL from the He
   assert.equal(result.status, 'disabled');
   assert.equal(
     result.activationUrl,
-    'https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=565782413738',
+    'https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=123456789012',
   );
 });
 

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { PDFDocument } from 'pdf-lib';
 import { setupTestServer, callTool, type TestContext } from '../helpers/setup-server.js';
-import { clearAuthModeOverrides } from '../helpers/env.js';
+import { clearAuthModeOverrides, setEnv } from '../helpers/env.js';
 import { apiErrorFixture, gaxiosErrorFor } from '../helpers/gaxios-error.js';
 
 describe('Drive tools', () => {
@@ -1000,18 +1000,19 @@ describe('Drive tools', () => {
         const payload = JSON.parse(text.slice(text.indexOf('{'), text.indexOf('\n\nSummary:')));
         assert.deepEqual(Object.keys(payload.apis).sort(), ['calendar', 'docs', 'drive', 'sheets', 'slides']);
         assert.equal(payload.apis.sheets.status, 'disabled');
-        const url = 'https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=565782413738';
+        const url = 'https://console.developers.google.com/apis/api/sheets.googleapis.com/overview?project=123456789012';
         assert.equal(payload.apis.sheets.activationUrl, url);
         for (const api of ['drive', 'docs', 'slides', 'calendar']) {
           assert.equal(payload.apis[api].status, 'enabled', `${api} answered`);
         }
-        assert.ok(
-          payload.warnings.some((w: string) => w.includes('Sheets') && w.includes(url)),
-          'a warning names the disabled API and where to enable it',
-        );
+        const warning = payload.warnings.find((w: string) => w.includes('Sheets') && w.includes(url));
+        assert.ok(warning, 'a warning names the disabled API and where to enable it');
+        // Only an OAuth client has "this OAuth client's project"; the same warning has to read
+        // right in service_account and external_token mode.
+        assert.ok(!/OAuth client/.test(warning), warning);
         assert.match(text, /APIs: drive enabled, docs enabled, sheets disabled, slides enabled, calendar enabled\./);
-        // One read per API: about.get is the identity lookup plus the Drive probe.
-        assert.equal(ctx.mocks.drive.tracker.getCalls('about.get').length, 2);
+        // Drive is reported from the identity lookup, so about.get is called once.
+        assert.equal(ctx.mocks.drive.tracker.getCalls('about.get').length, 1);
         assert.equal(ctx.mocks.docs.tracker.getCalls('documents.get').length, 1);
         assert.equal(ctx.mocks.sheets.tracker.getCalls('spreadsheets.get').length, 1);
         assert.equal(ctx.mocks.slides.tracker.getCalls('presentations.get').length, 1);
@@ -1022,6 +1023,78 @@ describe('Drive tools', () => {
         ctx.mocks.drive.service.about.get._resetImpl();
       }
     });
+
+    it('authGetStatus with checkApis probes Drive itself when the identity lookup failed', async () => {
+      ctx.mocks.drive.tracker.reset();
+      const disabled = await gaxiosErrorFor(403, apiErrorFixture('service-disabled-legacy.json'));
+      ctx.mocks.drive.service.about.get._setImpl(async () => { throw disabled; });
+      try {
+        const res = await callTool(ctx.client, 'authGetStatus', { checkApis: true });
+        assert.equal(res.isError, false);
+        const text = res.content[0].text!;
+        const payload = JSON.parse(text.slice(text.indexOf('{'), text.indexOf('\n\nSummary:')));
+        assert.equal(payload.apis.drive.status, 'disabled', 'the Drive probe classified the failure');
+        assert.equal(ctx.mocks.drive.tracker.getCalls('about.get').length, 2, 'identity lookup plus the Drive probe');
+      } finally {
+        ctx.mocks.drive.service.about.get._resetImpl();
+      }
+    });
+
+    it('authGetStatus with checkApis starts the probes without waiting for the identity lookup', async () => {
+      ctx.mocks.docs.tracker.reset();
+      let release!: () => void;
+      ctx.mocks.drive.service.about.get._setImpl(() => new Promise((resolve) => {
+        release = () => resolve({ data: { user: { displayName: 'Ada L', emailAddress: 'ada@example.com' } } });
+      }));
+      let pending: ReturnType<typeof callTool> | undefined;
+      try {
+        pending = callTool(ctx.client, 'authGetStatus', { checkApis: true });
+        // The identity lookup never settles until released, so a probe that has been
+        // sent by now did not wait for it.
+        for (let i = 0; i < 100 && ctx.mocks.docs.tracker.getCalls('documents.get').length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.equal(
+          ctx.mocks.docs.tracker.getCalls('documents.get').length,
+          1,
+          'the Docs probe was sent while the identity lookup was still pending',
+        );
+      } finally {
+        release?.();
+        if (pending) await pending;
+        ctx.mocks.drive.service.about.get._resetImpl();
+      }
+    });
+
+    for (const scenario of [
+      { scopes: 'drive.readonly', probed: ['docs', 'sheets', 'slides'], skipped: ['calendar'] },
+      { scopes: 'documents', probed: ['docs'], skipped: ['sheets', 'slides', 'calendar'] },
+    ]) {
+      it(`authGetStatus with checkApis does not probe an API whose scope was not requested (GOOGLE_DRIVE_MCP_SCOPES=${scenario.scopes})`, async () => {
+        const trackers: Record<string, { tracker: { reset(): void; calls: unknown[] } }> = {
+          docs: ctx.mocks.docs, sheets: ctx.mocks.sheets, slides: ctx.mocks.slides, calendar: ctx.mocks.calendar,
+        };
+        for (const t of Object.values(trackers)) t.tracker.reset();
+        const saved = setEnv({ GOOGLE_DRIVE_MCP_SCOPES: scenario.scopes });
+        try {
+          const res = await callTool(ctx.client, 'authGetStatus', { checkApis: true });
+          assert.equal(res.isError, false, res.content[0].text);
+          const text = res.content[0].text!;
+          const payload = JSON.parse(text.slice(text.indexOf('{'), text.indexOf('\n\nSummary:')));
+          for (const api of scenario.probed) {
+            assert.equal(trackers[api].tracker.calls.length, 1, `${api} was probed`);
+            assert.equal(payload.apis[api].status, 'enabled', api);
+          }
+          for (const api of scenario.skipped) {
+            assert.equal(trackers[api].tracker.calls.length, 0, `${api} was not probed`);
+            assert.equal(payload.apis[api].status, 'unknown', api);
+            assert.match(payload.apis[api].message, /^Not checked: no \w+ scope requested$/, api);
+          }
+        } finally {
+          saved.restore();
+        }
+      });
+    }
 
     it('authListScopes returns scopes payload', async () => {
       const res = await callTool(ctx.client, 'authListScopes', {});
@@ -1281,5 +1354,53 @@ describe('Drive tools', () => {
         await rm(tempDir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+// The admin path tolerates a missing or unusable default account, so authGetStatus
+// still runs with no client at all. Sending probes then would reach Google with no
+// credentials and report the 401 as five separate unknowns.
+describe('authGetStatus checkApis with no usable account', () => {
+  let ctx: TestContext;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let sys: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let record: any;
+  let client: unknown;
+
+  before(async () => {
+    ctx = await setupTestServer();
+    const mod = await import('../../src/index.js');
+    sys = mod._getAuthSystemForTesting();
+    record = sys.store.get('test');
+    client = sys.store.getSyntheticClient('test');
+    await sys.store.remove('test');
+  });
+
+  after(async () => {
+    // Put the same account and client back so nothing after this file notices.
+    sys.store.setSyntheticAccount(record, client);
+    await ctx.cleanup();
+  });
+
+  it('reports all five APIs as unknown with one local message and sends no request', async () => {
+    for (const m of [ctx.mocks.drive, ctx.mocks.docs, ctx.mocks.sheets, ctx.mocks.slides, ctx.mocks.calendar]) {
+      m.tracker.reset();
+    }
+    const res = await callTool(ctx.client, 'authGetStatus', { checkApis: true });
+    assert.equal(res.isError, false, res.content[0].text);
+    const text = res.content[0].text!;
+    const payload = JSON.parse(text.slice(text.indexOf('{'), text.indexOf('\n\nSummary:')));
+    assert.deepEqual(Object.keys(payload.apis).sort(), ['calendar', 'docs', 'drive', 'sheets', 'slides']);
+    const messages = new Set<string>();
+    for (const api of Object.keys(payload.apis)) {
+      assert.equal(payload.apis[api].status, 'unknown', api);
+      messages.add(payload.apis[api].message);
+    }
+    assert.equal(messages.size, 1, `one message for one cause, got: ${[...messages].join(' | ')}`);
+    assert.match([...messages][0], /^No authenticated client/);
+    for (const m of [ctx.mocks.drive, ctx.mocks.docs, ctx.mocks.sheets, ctx.mocks.slides, ctx.mocks.calendar]) {
+      assert.equal(m.tracker.calls.length, 0);
+    }
   });
 });

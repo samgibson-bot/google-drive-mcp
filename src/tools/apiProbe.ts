@@ -14,6 +14,26 @@ export interface ApiProbeResult {
 
 export const DEFAULT_API_PROBE_TIMEOUT_MS = 10_000;
 
+const AUTH = 'https://www.googleapis.com/auth/';
+
+/**
+ * The OAuth scopes each probe request is authorized by, from the reference page
+ * of the method it calls: documents.get, spreadsheets.get, presentations.get and
+ * calendars.get. The Drive family covers the first three, but not Calendar, and
+ * calendar.events does not cover calendars.get.
+ */
+export const API_PROBE_SCOPES = {
+  docs: ['documents', 'documents.readonly', 'drive', 'drive.readonly', 'drive.file'],
+  sheets: ['spreadsheets', 'spreadsheets.readonly', 'drive', 'drive.readonly', 'drive.file'],
+  slides: ['presentations', 'presentations.readonly', 'drive', 'drive.readonly', 'drive.file'],
+  calendar: ['calendar', 'calendar.readonly', 'calendar.app.created', 'calendar.calendars', 'calendar.calendars.readonly'],
+} as const;
+
+/** True when the requested scopes include one that authorizes the API's probe request. */
+export function requestsProbeScope(requestedScopes: readonly string[], api: keyof typeof API_PROBE_SCOPES): boolean {
+  return API_PROBE_SCOPES[api].some((scope) => requestedScopes.includes(`${AUTH}${scope}`));
+}
+
 interface GoogleErrorBody {
   code?: number;
   message?: string;
